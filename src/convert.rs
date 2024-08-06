@@ -1,12 +1,11 @@
 use crate::oscar::Document;
 use arrow::{
     array::{
-        ArrayRef, Float32Builder, Int32Builder, ListBuilder, RecordBatch, StringBuilder,
-        StructArray,
+        ArrayBuilder, ArrayRef, Float32Builder, Int32Builder, LargeStringBuilder, ListBuilder,
+        RecordBatch, StringBuilder, StructArray,
     },
     datatypes::{DataType, Field},
 };
-use futures::{stream, StreamExt};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
@@ -18,9 +17,10 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
+use tokio::{sync::Semaphore, task::JoinSet};
 use walkdir::{DirEntry, WalkDir};
 
-// Converts `Vec<LoteBuilder>` into `StructArray`
+// Converts OscarBuilder` into `StructArray`
 #[derive(Debug, Default)]
 struct OscarBuilder {
     warc_record_id: StringBuilder,
@@ -28,7 +28,7 @@ struct OscarBuilder {
     warc_target_uri: StringBuilder,
     warc_date: StringBuilder,
 
-    content: StringBuilder,
+    content: LargeStringBuilder,
 
     identified_doc_lang: StringBuilder,
     identified_doc_prob: Float32Builder,
@@ -130,7 +130,7 @@ impl OscarBuilder {
         let warc_date_field = Arc::new(Field::new("warc_date", DataType::Utf8, true));
 
         let content = Arc::new(self.content.finish()) as ArrayRef;
-        let content_field = Arc::new(Field::new("content", DataType::Utf8, false));
+        let content_field = Arc::new(Field::new("content", DataType::LargeUtf8, false));
 
         let identified_doc_lang = Arc::new(self.identified_doc_lang.finish()) as ArrayRef;
         let identified_doc_lang_field =
@@ -233,13 +233,6 @@ impl<'a> Extend<&'a Document> for OscarBuilder {
     }
 }
 
-/// Converts a slice of [`Document`] to a [`RecordBatch`]
-fn rows_to_batch(rows: &[Document]) -> RecordBatch {
-    let mut builder = OscarBuilder::default();
-    builder.extend(rows);
-    RecordBatch::from(&builder.finish())
-}
-
 fn write_to_parquet(batch: RecordBatch, folder_path: &PathBuf, lang: &str, part: usize) {
     let mut path = folder_path.clone();
     path.push(format!("{}_part_{}.parquet", lang, part));
@@ -270,7 +263,7 @@ async fn process_file(file: DirEntry, dst: PathBuf) {
         std::fs::create_dir_all(&folder_path).unwrap();
     }
 
-    let mut records: Vec<Document> = vec![];
+    let mut record_builder = OscarBuilder::default();
 
     let jsonl = {
         let file = File::open(file.path()).unwrap();
@@ -284,16 +277,24 @@ async fn process_file(file: DirEntry, dst: PathBuf) {
     for line in jsonl.lines() {
         let line = line.unwrap();
         let document: Document = serde_json::from_str(&line).unwrap();
-        records.push(document);
-        if records.len() >= 90_000 {
-            let batch = rows_to_batch(&records);
-            write_to_parquet(batch, &folder_path, lang, part);
-            records.clear();
+        record_builder.append(&document);
+        if record_builder.warc_record_id.len() >= 90_000 {
+            write_to_parquet(
+                RecordBatch::from(record_builder.finish()),
+                &folder_path,
+                lang,
+                part,
+            );
+            record_builder = OscarBuilder::default();
             part += 1;
         }
     }
-    let batch = rows_to_batch(&records);
-    write_to_parquet(batch, &folder_path, lang, part);
+    write_to_parquet(
+        RecordBatch::from(record_builder.finish()),
+        &folder_path,
+        lang,
+        part,
+    );
     println!(
         "Finished processing file: {}",
         file.file_name().to_str().unwrap(),
@@ -308,15 +309,19 @@ pub async fn convert_to_parquet(src: &PathBuf, dst: &PathBuf, threads: usize) {
         .filter(|e| e.file_name().to_str().unwrap().ends_with(".jsonl"))
         .collect();
 
-    let stream = stream::iter(file_paths);
+    let semaphore = Arc::new(Semaphore::new(threads));
+    let mut set = JoinSet::new();
 
-    let tasks = stream
-        .enumerate()
-        .for_each_concurrent(Some(threads), |(_number, file)| {
-            let dst = dst.clone();
-            async move {
-                let _task = tokio::task::spawn(process_file(file, dst)).await;
-            }
+    for file in file_paths {
+        let dst = dst.clone();
+        let semaphore = semaphore.clone();
+        set.spawn(async move {
+            let _permit = semaphore.acquire().await;
+            process_file(file, dst).await;
         });
-    tasks.await;
+    }
+
+    while let Some(result) = set.join_next().await {
+        result.unwrap();
+    }
 }
