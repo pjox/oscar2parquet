@@ -6,7 +6,6 @@ use arrow::{
     },
     datatypes::{DataType, Field},
 };
-//use futures::{stream, StreamExt};
 use parquet::{
     arrow::ArrowWriter,
     basic::{Compression, ZstdLevel},
@@ -21,7 +20,7 @@ use std::{
 use tokio::{sync::Semaphore, task::JoinSet};
 use walkdir::{DirEntry, WalkDir};
 
-// Converts `Vec<LoteBuilder>` into `StructArray`
+// Converts OscarBuilder` into `StructArray`
 #[derive(Debug, Default)]
 struct OscarBuilder {
     warc_record_id: StringBuilder,
@@ -234,13 +233,6 @@ impl<'a> Extend<&'a Document> for OscarBuilder {
     }
 }
 
-/// Converts a slice of [`Document`] to a [`RecordBatch`]
-// fn rows_to_batch(rows: &[Document]) -> RecordBatch {
-//     let mut builder = OscarBuilder::default();
-//     builder.extend(rows);
-//     RecordBatch::from(&builder.finish())
-// }
-
 fn write_to_parquet(batch: RecordBatch, folder_path: &PathBuf, lang: &str, part: usize) {
     let mut path = folder_path.clone();
     path.push(format!("{}_part_{}.parquet", lang, part));
@@ -271,7 +263,6 @@ async fn process_file(file: DirEntry, dst: PathBuf) {
         std::fs::create_dir_all(&folder_path).unwrap();
     }
 
-    // let mut records: Vec<Document> = vec![];
     let mut record_builder = OscarBuilder::default();
 
     let jsonl = {
@@ -289,7 +280,7 @@ async fn process_file(file: DirEntry, dst: PathBuf) {
         record_builder.append(&document);
         if record_builder.warc_record_id.len() >= 90_000 {
             write_to_parquet(
-                RecordBatch::from(&record_builder.finish()),
+                RecordBatch::from(record_builder.finish()),
                 &folder_path,
                 lang,
                 part,
@@ -299,7 +290,7 @@ async fn process_file(file: DirEntry, dst: PathBuf) {
         }
     }
     write_to_parquet(
-        RecordBatch::from(&record_builder.finish()),
+        RecordBatch::from(record_builder.finish()),
         &folder_path,
         lang,
         part,
